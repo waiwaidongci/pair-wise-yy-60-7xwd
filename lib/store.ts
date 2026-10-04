@@ -1,85 +1,210 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { dispatchAction, fetchEvidence } from './api';
+import { mintOpId } from './issuance/engine';
+import type { BasisDigest, GateId, Role } from './issuance/types';
 
-export type RecordStatus = '待核验' | '复核中' | '已核验' | '需补证';
-export type CarbonRecord = {
-  id: string;
-  source: string;
-  activity: number;
-  unit: string;
-  factor: number;
-  factorUnit: string;
-  timeRange: string;
-  evidenceCount: number;
-  anomaly: number;
-  owner: string;
-  status: RecordStatus;
-  revision: number;
+type ProjectMeta = {
+  project: { id: string; name: string; methodology: string; vintage: string; verifier: string };
+  summary: { period: string; reduction: number; evidenceRate: number; openFindings: number; sampled: number };
 };
 
-export type Finding = {
-  id: string;
-  recordId: string;
-  type: '缺失证据' | '单位不一致' | '时间范围' | '异常波动';
-  title: string;
-  detail: string;
-  assignee: string;
-  due: string;
-  status: '开放' | '补证中' | '已关闭';
-};
+type Notice = { severity: 'success' | 'info' | 'warning' | 'error'; text: string } | null;
 
-const defaultRecords: CarbonRecord[] = [
-  { id: 'ACT-0318', source: '电表 E-17 / 四号压缩机组', activity: 428650, unit: 'kWh', factor: 0.5568, factorUnit: 'tCO2/MWh', timeRange: '2026-07-01 至 07-31', evidenceCount: 4, anomaly: 2.3, owner: '项目现场 O2', status: '复核中', revision: 3 },
-  { id: 'ACT-0321', source: '蒸汽流量计 ST-04', activity: 2038.4, unit: 'GJ', factor: 0.1100, factorUnit: 'tCO2/GJ', timeRange: '2026-07-01 至 07-31', evidenceCount: 3, anomaly: 0, owner: '能源中心', status: '已核验', revision: 2 },
-  { id: 'ACT-0325', source: '柴油消耗台账 / 应急泵', activity: 1846, unit: 'L', factor: 2.6800, factorUnit: 'kgCO2/L', timeRange: '2026-07-01 至 07-31', evidenceCount: 2, anomaly: 8.6, owner: '设备保障部', status: '需补证', revision: 4 },
-  { id: 'ACT-0331', source: '光伏逆变器阵列 PV-2', activity: 182460, unit: 'kWh', factor: 0.5568, factorUnit: 'tCO2/MWh', timeRange: '2026-07-01 至 07-31', evidenceCount: 5, anomaly: -1.2, owner: '新能源运维', status: '已核验', revision: 1 },
-  { id: 'ACT-0337', source: '天然气流量计 NG-02', activity: 62.8, unit: 'kNm3', factor: 2.1622, factorUnit: 'tCO2/kNm3', timeRange: '2026-07-01 至 07-31', evidenceCount: 1, anomaly: 12.4, owner: '热力站', status: '待核验', revision: 1 }
-];
-
-const defaultFindings: Finding[] = [
-  { id: 'F-104', recordId: 'ACT-0337', type: '缺失证据', title: '缺少天然气流量计校验证书', detail: '计量记录已提交，但校准有效期证明不足。', assignee: '热力站 · 韩跃', due: '09-30', status: '开放' },
-  { id: 'F-105', recordId: 'ACT-0325', type: '异常波动', title: '柴油消耗较上期上升 18.6%', detail: '项目方尚未说明测试运行时长变化。', assignee: '设备保障部 · 姜婷', due: '10-02', status: '补证中' },
-  { id: 'F-106', recordId: 'ACT-0318', type: '单位不一致', title: '原始表单位为 MWh，台账记录为 kWh', detail: '需补充单位换算链并保留原始记录。', assignee: '项目现场 · 徐璐', due: '09-30', status: '开放' }
-];
+/** 写入超时后悬而未决的操作：同操作号重试，或回最后确认版本恢复 */
+type PendingWrite = {
+  opId: string;
+  action: string;
+  label: string;
+  /** 原始请求体（opId 不变，服务端据此幂等回放） */
+  body: Record<string, unknown>;
+} | null;
 
 type State = {
-  records: CarbonRecord[];
-  findings: Finding[];
+  hydrated: boolean;
+  meta: ProjectMeta | null;
+  basis: BasisDigest | null;
+  role: Role;
+  actor: string;
+  notice: Notice;
+  busy: boolean;
   selectedRecordId: string;
   sampledIds: string[];
-  issuanceChecks: Record<string, boolean>;
+  pendingWrite: PendingWrite;
+
+  hydrate: () => Promise<void>;
+  setRole: (role: Role) => void;
   selectRecord: (id: string) => void;
   toggleSample: (id: string) => void;
-  startCorrection: (id: string) => void;
-  verifyRecord: (id: string) => void;
-  batchVerify: () => void;
-  requestEvidence: (findingId: string) => void;
-  closeFinding: (findingId: string) => void;
-  toggleIssuanceCheck: (id: string) => void;
-  reviseValue: (id: string, value: number, reason: string) => void;
+  resetAll: () => Promise<void>;
+
+  revise: (args: { recordId: string; patch: { activity?: number; unit?: string; source?: string; reason: string; baseVersion: number }; simulateWriteFailure?: boolean }) => Promise<void>;
+  supplement: (args: { recordId: string; count: number; note?: string; simulateWriteFailure?: boolean }) => Promise<void>;
+  verify: (recordId: string) => Promise<void>;
+  findingAction: (findingId: string, mode: 'request' | 'close') => Promise<void>;
+  recomputeGate: (gateId: GateId) => Promise<void>;
+  confirm: (methodologyPassed: boolean) => Promise<void>;
+  release: () => Promise<void>;
+  resolveConflict: (conflictOpId: string, resolution: 'abandon' | 'rebase') => Promise<void>;
+  retryPending: () => Promise<void>;
+  recover: () => Promise<void>;
+  clearNotice: () => void;
+};
+
+export const roleActors: Record<Role, string> = {
+  现场: '徐璐（现场）',
+  核验员: '沈楠（核验员）',
+  复核员: '韩跃（复核员）'
 };
 
 export const useCarbonStore = create<State>()(
   persist(
-    (set) => ({
-      records: defaultRecords,
-      findings: defaultFindings,
-      selectedRecordId: 'ACT-0318',
-      sampledIds: ['ACT-0318', 'ACT-0337'],
-      issuanceChecks: { evidence: false, calculation: true, revisions: true, methodology: false },
-      selectRecord: (id) => set({ selectedRecordId: id }),
-      toggleSample: (id) => set((state) => ({ sampledIds: state.sampledIds.includes(id) ? state.sampledIds.filter((item) => item !== id) : [...state.sampledIds, id] })),
-      startCorrection: (id) => set((state) => ({ records: state.records.map((record) => record.id === id ? { ...record, status: '复核中' } : record) })),
-      verifyRecord: (id) => set((state) => ({ records: state.records.map((record) => record.id === id ? { ...record, status: '已核验' } : record) })),
-      batchVerify: () => set((state) => ({ records: state.records.map((record) => state.sampledIds.includes(record.id) && record.status !== '需补证' ? { ...record, status: '已核验' } : record) })),
-      requestEvidence: (findingId) => set((state) => ({ findings: state.findings.map((finding) => finding.id === findingId ? { ...finding, status: '补证中' } : finding) })),
-      closeFinding: (findingId) => set((state) => ({ findings: state.findings.map((finding) => finding.id === findingId ? { ...finding, status: '已关闭' } : finding) })),
-      toggleIssuanceCheck: (id) => set((state) => ({ issuanceChecks: { ...state.issuanceChecks, [id]: !state.issuanceChecks[id] } })),
-      reviseValue: (id, value, reason) => set((state) => ({
-        records: state.records.map((record) => record.id === id ? { ...record, activity: value, revision: record.revision + 1, status: '复核中' } : record),
-        findings: reason ? state.findings : state.findings
-      }))
-    }),
-    { name: 'yy60-carbon-evidence' }
+    (set, get) => {
+      const apply = async (
+        body: Record<string, unknown>,
+        opts: { successText: (basis: BasisDigest) => string; pendingLabel?: string }
+      ) => {
+        set({ busy: true });
+        try {
+          const res = await dispatchAction({ actor: get().actor, role: get().role, ...body });
+          set({ basis: res.basis });
+          if (res.ok) {
+            set({ notice: { severity: 'success', text: opts.successText(res.basis) }, pendingWrite: null });
+          } else if (res.error?.startsWith('WRITE_TIMEOUT')) {
+            const opId = String(body.opId ?? '');
+            const pending: PendingWrite = { opId, action: String(body.action), label: opts.pendingLabel ?? '写入超时的操作', body: { ...body } };
+            set({ notice: { severity: 'warning', text: `${res.error}（操作号 ${opId}）` }, pendingWrite: pending });
+          } else {
+            set({ notice: { severity: 'error', text: res.error ?? '操作被拒绝。' } });
+          }
+        } catch (error) {
+          set({ notice: { severity: 'error', text: `网络异常：${error instanceof Error ? error.message : String(error)}` } });
+        } finally {
+          set({ busy: false });
+        }
+      };
+
+      return {
+        hydrated: false,
+        meta: null,
+        basis: null,
+        role: '核验员',
+        actor: roleActors['核验员'],
+        notice: null,
+        busy: false,
+        selectedRecordId: 'ACT-0318',
+        sampledIds: ['ACT-0318', 'ACT-0337'],
+        pendingWrite: null,
+
+        hydrate: async () => {
+          const data = await fetchEvidence();
+          set({ meta: { project: data.project, summary: data.summary }, basis: data.basis, hydrated: true });
+        },
+
+        setRole: (role) => set({ role, actor: roleActors[role], notice: { severity: 'info', text: `已切换为 ${role}：${roleActors[role]}` } }),
+        selectRecord: (id) => set({ selectedRecordId: id }),
+        toggleSample: (id) => set((state) => ({ sampledIds: state.sampledIds.includes(id) ? state.sampledIds.filter((item) => item !== id) : [...state.sampledIds, id] })),
+
+        clearNotice: () => set({ notice: null }),
+
+        resetAll: async () => {
+          set({ busy: true });
+          const res = await dispatchAction({ action: 'reset', actor: get().actor, role: get().role });
+          set({ basis: res.basis, notice: { severity: 'info', text: '已重置为演示初始依据（V1）。' }, pendingWrite: null, busy: false });
+        },
+
+        revise: async ({ recordId, patch, simulateWriteFailure }) => {
+          const opId = mintOpId();
+          await apply(
+            { action: 'revise', recordId, patch, opId, simulateWriteFailure: Boolean(simulateWriteFailure) },
+            {
+              successText: (b) => `修订已进入签发依据 V${b.basisVersion}，操作号 ${opId}；关联发现项与门禁已按新版本重算。`,
+              pendingLabel: `修订 ${recordId}`
+            }
+          );
+        },
+
+        supplement: async ({ recordId, count, note, simulateWriteFailure }) => {
+          const opId = mintOpId();
+          await apply(
+            { action: 'supplement', recordId, evidenceCount: count, note, opId, simulateWriteFailure: Boolean(simulateWriteFailure) },
+            { successText: (b) => `补证已进入同一签发依据 V${b.basisVersion}，操作号 ${opId}。`, pendingLabel: `补证 ${recordId}` }
+          );
+        },
+
+        verify: async (recordId) => {
+          const opId = mintOpId();
+          await apply(
+            { action: 'verify', recordId, opId },
+            { successText: (b) => `核验通过，结论绑定依据 V${b.basisVersion}。` }
+          );
+        },
+
+        findingAction: async (findingId, mode) => {
+          const res = await dispatchAction({ action: 'finding', findingId, note: mode === 'close' ? 'close' : 'request', actor: get().actor, role: get().role });
+          set({ basis: res.basis });
+          if (res.ok) set({ notice: { severity: 'success', text: mode === 'close' ? '发现项已闭环。' : '已发起补证，现场补证后进入同一依据。' } });
+          else set({ notice: { severity: 'error', text: res.error ?? '操作被拒绝。' } });
+        },
+
+        recomputeGate: async (gateId) => {
+          const opId = mintOpId();
+          await apply(
+            { action: 'gate', gateId, opId },
+            { successText: (b) => `门禁已按当前依据 V${b.basisVersion} 重算。` }
+          );
+        },
+
+        confirm: async (methodologyPassed) => {
+          const opId = mintOpId();
+          await apply(
+            { action: 'confirm', methodologyPassed, opId },
+            { successText: (b) => `复核员已确认签发依据 V${b.basisVersion}，并留存该版本快照。` }
+          );
+        },
+
+        release: async () => {
+          const opId = mintOpId();
+          await apply(
+            { action: 'release', opId },
+            { successText: (b) => `放行成功：签发依据 V${b.basisVersion} 全部门禁通过且确认版本一致。` }
+          );
+        },
+
+        resolveConflict: async (conflictOpId, resolution) => {
+          await apply(
+            { action: 'resolve-conflict', conflictOpId, resolution },
+            {
+              successText: (b) => resolution === 'rebase'
+                ? `后到修订已基于最新版本重生，进入依据 V${b.basisVersion}。`
+                : '后到修订已放弃，未进入签发依据。'
+            }
+          );
+        },
+
+        retryPending: async () => {
+          const pending = get().pendingWrite;
+          if (!pending) return;
+          // 用原操作号、原请求体重放（去掉故障模拟）：服务端按 opId 幂等，不重复记账
+          const replayBody: Record<string, unknown> = { ...pending.body, replay: true };
+          delete replayBody.simulateWriteFailure;
+          await apply(
+            replayBody,
+            { successText: (b) => `原操作号 ${pending.opId} 重试完成：命中幂等回放，未重复记账，当前依据 V${b.basisVersion}。` }
+          );
+        },
+
+        recover: async () => {
+          const res = await dispatchAction({ action: 'recover', actor: get().actor, role: get().role });
+          set({ basis: res.basis });
+          if (res.ok) set({ notice: { severity: 'success', text: `已从最后确认版本恢复到 V${res.recoveredToBasis}，其后误记的账已回滚。` }, pendingWrite: null });
+          else set({ notice: { severity: 'error', text: res.error ?? '恢复失败。' } });
+        }
+      };
+    },
+    {
+      name: 'yy60-issuance-basis',
+      partialize: (state) => ({ role: state.role, actor: state.actor, selectedRecordId: state.selectedRecordId, sampledIds: state.sampledIds })
+    }
   )
 );
