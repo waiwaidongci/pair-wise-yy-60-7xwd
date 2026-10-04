@@ -1,39 +1,126 @@
 import { NextResponse } from 'next/server';
-import { evidenceResponseSchema } from '@/lib/schema';
+import {
+  backfillBasis,
+  commitRevision,
+  confirmGate,
+  unconfirmGate,
+  setFindingStatus,
+  type Basis
+} from '@/lib/basis';
+import { defaultRecords, defaultFindings } from '@/lib/seed';
+import { operationSchema, operationResultSchema } from '@/lib/schema';
 
-const data = {
-  project: {
-    id: 'CN-ER-2026-041',
-    name: '临港工业园区能效提升项目',
-    methodology: 'CMS-052-V01',
-    vintage: '2026 监测年度',
-    verifier: '华碳认证 · 核验组 B'
-  },
-  summary: {
-    period: '2026 年第三监测期',
-    reduction: 18426,
-    evidenceRate: 92,
-    openFindings: 3,
-    sampled: 18
-  },
-  records: [
-    { id: 'ACT-0318', source: '电表 E-17 / 四号压缩机组', activity: 428650, unit: 'kWh', factor: 0.5568, factorUnit: 'tCO2/MWh', timeRange: '2026-07-01 至 07-31', evidenceCount: 4, anomaly: 2.3, owner: '项目现场 O2', status: '复核中', revision: 3 },
-    { id: 'ACT-0321', source: '蒸汽流量计 ST-04', activity: 2038.4, unit: 'GJ', factor: 0.1100, factorUnit: 'tCO2/GJ', timeRange: '2026-07-01 至 07-31', evidenceCount: 3, anomaly: 0, owner: '能源中心', status: '已核验', revision: 2 },
-    { id: 'ACT-0325', source: '柴油消耗台账 / 应急泵', activity: 1846, unit: 'L', factor: 2.6800, factorUnit: 'kgCO2/L', timeRange: '2026-07-01 至 07-31', evidenceCount: 2, anomaly: 8.6, owner: '设备保障部', status: '需补证', revision: 4 },
-    { id: 'ACT-0331', source: '光伏逆变器阵列 PV-2', activity: 182460, unit: 'kWh', factor: 0.5568, factorUnit: 'tCO2/MWh', timeRange: '2026-07-01 至 07-31', evidenceCount: 5, anomaly: -1.2, owner: '新能源运维', status: '已核验', revision: 1 },
-    { id: 'ACT-0337', source: '天然气流量计 NG-02', activity: 62.8, unit: 'kNm3', factor: 2.1622, factorUnit: 'tCO2/kNm3', timeRange: '2026-07-01 至 07-31', evidenceCount: 1, anomaly: 12.4, owner: '热力站', status: '待核验', revision: 1 }
-  ]
+export const dynamic = 'force-dynamic';
+
+const project = {
+  id: 'CN-ER-2026-041',
+  name: '临港工业园区能效提升项目',
+  methodology: 'CMS-052-V01',
+  vintage: '2026 监测年度',
+  verifier: '华碳认证 · 核验组 B'
 };
 
+const summary = {
+  period: '2026 年第三监测期',
+  reduction: 18426,
+  evidenceRate: 92,
+  openFindings: 3,
+  sampled: 18
+};
+
+/**
+ * 服务端持有权威签发依据（内存态）。
+ * 所有写入经同一内核规则判定：先到生效、后到留冲突不进依据、越权拒绝、操作号幂等。
+ */
+let basis: Basis = backfillBasis({ records: defaultRecords, findings: defaultFindings, version: 1 });
+
 export async function GET() {
-  return NextResponse.json(evidenceResponseSchema.parse(data));
+  return NextResponse.json({ project, summary, basis });
 }
 
 export async function POST(request: Request) {
-  const body = await request.json() as { recordId?: string; value?: number; reason?: string };
-  return NextResponse.json({
-    accepted: Boolean(body.recordId && body.reason && typeof body.value === 'number'),
-    revision: 5,
-    recordedAt: new Date().toISOString()
-  });
+  // 演示用：模拟写入失败（服务端未推进版本，客户端应回滚到最后确认版本）。
+  if (request.headers.get('x-simulate-failure') === '1') {
+    return NextResponse.json({ error: 'simulated write failure' }, { status: 500 });
+  }
+
+  const body = operationSchema.safeParse(await request.json().catch(() => null));
+  if (!body.success) {
+    return NextResponse.json({ accepted: false, reason: 'conflict', basis }, { status: 400 });
+  }
+  const op = body.data;
+
+  let result;
+  switch (op.kind) {
+    case 'revision':
+      result = commitRevision(basis, {
+        operationId: op.operationId,
+        recordId: op.recordId!,
+        expectedVersion: op.expectedVersion,
+        changes: op.changes ?? {},
+        reason: op.reason ?? '',
+        actor: op.actor,
+        actorRole: op.actorRole
+      });
+      break;
+    case 'confirmGate':
+      result = confirmGate(basis, {
+        operationId: op.operationId,
+        gateId: op.gateId!,
+        expectedVersion: op.expectedVersion,
+        actor: op.actor,
+        actorRole: op.actorRole
+      });
+      break;
+    case 'unconfirmGate':
+      result = unconfirmGate(basis, {
+        operationId: op.operationId,
+        gateId: op.gateId!,
+        expectedVersion: op.expectedVersion,
+        actor: op.actor,
+        actorRole: op.actorRole
+      });
+      break;
+    case 'finding':
+      result = setFindingStatus(basis, {
+        operationId: op.operationId,
+        findingId: op.findingId!,
+        status: op.status ?? '开放',
+        expectedVersion: op.expectedVersion,
+        actor: op.actor,
+        actorRole: op.actorRole
+      });
+      break;
+  }
+
+  if (result.ok) {
+    basis = result.basis;
+    return NextResponse.json(
+      operationResultSchema.parse({
+        accepted: true,
+        idempotent: result.idempotent === true,
+        basis: result.basis,
+        revision: result.revision
+      })
+    );
+  }
+
+  if (result.reason === 'conflict') {
+    basis = result.basis; // 冲突留痕（conflicts 追加），但不进依据
+    return NextResponse.json(
+      operationResultSchema.parse({
+        accepted: false,
+        reason: 'conflict',
+        basis: result.basis,
+        conflict: result.conflict
+      }),
+      { status: 409 }
+    );
+  }
+
+  // 越权拒绝：依据不变。
+  return NextResponse.json(
+    operationResultSchema.parse({ accepted: false, reason: 'forbidden', basis: result.basis }),
+    { status: 403 }
+  );
 }
